@@ -136,6 +136,15 @@ section.block { margin-top: 26px; }
 .tips summary { cursor: pointer; font-weight: 600; padding: 12px 0; min-height: 44px; }
 .tips ul { margin: 0 0 14px; padding-left: 20px; }
 .tips li { margin: 4px 0; }
+.settings { margin: 12px 0; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 0 14px; }
+.settings summary { cursor: pointer; font-weight: 600; padding: 12px 0; min-height: 44px; }
+.settings .hint { color: var(--muted); font-size: .9rem; margin: 0 0 10px; }
+.presets { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 12px; }
+.ctl { margin: 10px 0 14px; }
+.ctl-head { display: flex; justify-content: space-between; gap: 10px; font-size: .95rem; font-weight: 600; margin-bottom: 4px; }
+.ctl-head .val { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+.ctl input[type="range"] { width: 100%; accent-color: var(--wine); min-height: 32px; }
+.ctl select { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); min-height: 44px; width: 100%; }
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -176,6 +185,19 @@ section.block { margin-top: 26px; }
       <button type="button" class="btn secondary" id="btn-torch" hidden>Feneri aç</button>
       <label class="check"><input type="checkbox" id="chk-auto" checked> Koli tamamlanınca otomatik kaydet</label>
     </div>
+
+    <details class="settings" id="cam-settings" hidden>
+      <summary>Kamera ayarları</summary>
+      <p class="hint">“Hareketli okuma” pozlamayı yaklaşık 1 ms’ye kısaltır, ISO’yu yükseltir ve feneri açar. Görüntü kararırsa ISO’yu artırın ya da ortamı aydınlatın; karıncalanma çoksa pozlamayı biraz uzatın. Ayarlar bu telefonda hatırlanır.</p>
+      <p class="hint" id="cam-info"></p>
+      <div class="presets">
+        <button type="button" class="btn small" data-preset="moving">Hareketli okuma</button>
+        <button type="button" class="btn secondary small" data-preset="still">Sabit okuma</button>
+        <button type="button" class="btn secondary small" data-preset="lockfocus">Odağı kilitle</button>
+        <button type="button" class="btn secondary small" data-preset="reset">Otomatiğe dön</button>
+      </div>
+      <div id="cam-controls"></div>
+    </details>
 
     <div class="tally">
       <span class="num bad" id="live-tally">0/12</span>
@@ -239,6 +261,7 @@ section.block { margin-top: 26px; }
       <li>Daha önce kaydedilmiş bir kolideki kod tekrar görülürse listeye eklenmez, turuncu çerçeveyle gösterilir.</li>
       <li>Kodlar uzaktan okunmuyorsa telefonu yaklaştırın. Canlı görüntü fotoğraftan düşük çözünürlüklüdür.</li>
       <li>Bandrolde parlama varsa telefonu hafifçe eğin. Fener parlamayı artırabilir, gerekirse kullanın.</li>
+      <li>Kağıt veya koli hareket halindeyken okumak için Kamera ayarları’ndan “Hareketli okuma”yı seçin, ardından telefonu sabit tutup odağı kilitleyin.</li>
       <li>Canlı kamera açılmazsa Fotoğraf modunu kullanın.</li>
     </ul>
   </details>
@@ -537,6 +560,8 @@ section.block { margin-top: 26px; }
     await new Promise(function (r) { if (video.videoWidth) r(); else video.onloadedmetadata = function () { r(); }; });
     sizeStage();
     $("placeholder").hidden = true;
+    await restoreSettings();
+    buildSettings();
     $("btn-cam").textContent = "Kamerayı kapat";
     try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
     running = true;
@@ -552,10 +577,181 @@ section.block { margin-top: 26px; }
     $("placeholder").hidden = false;
     $("btn-cam").textContent = "Kamerayı aç";
     $("btn-torch").hidden = true;
+    $("cam-settings").hidden = true;
     $("live-meta").textContent = "";
     try { if (wakeLock) wakeLock.release(); } catch (e) {}
     wakeLock = null;
   }
+
+  // ---------- Kamera ayarları ----------
+  // Not: Tarayıcı standardında exposureTime 100 mikrosaniye birimindedir (10 = 1 ms).
+  var SKEY = "koliqr.camsettings.v1";
+  var CTL = [
+    { key: "exposureTime", label: "Pozlama süresi", mode: "exposureMode", fmt: function (v) { return (v / 10).toLocaleString("tr-TR", { maximumFractionDigits: 2 }) + " ms"; } },
+    { key: "iso", label: "ISO (ışık hassasiyeti)", mode: "exposureMode" },
+    { key: "exposureCompensation", label: "Parlaklık düzeltme (EV)" },
+    { key: "focusDistance", label: "Odak mesafesi", mode: "focusMode" },
+    { key: "colorTemperature", label: "Renk sıcaklığı (K)", mode: "whiteBalanceMode" },
+    { key: "zoom", label: "Yakınlaştırma" },
+    { key: "brightness", label: "Parlaklık" },
+    { key: "contrast", label: "Kontrast" },
+    { key: "sharpness", label: "Keskinlik" },
+    { key: "saturation", label: "Doygunluk" }
+  ];
+  var MODES = [
+    { key: "exposureMode", label: "Pozlama modu" },
+    { key: "focusMode", label: "Odak modu" },
+    { key: "whiteBalanceMode", label: "Beyaz dengesi" }
+  ];
+  var MODE_TR = { manual: "Manuel", continuous: "Sürekli otomatik", "single-shot": "Tek seferlik", none: "Yok" };
+  var savedSettings = {};
+  try { savedSettings = JSON.parse(localStorage.getItem(SKEY) || "{}") || {}; } catch (e) { savedSettings = {}; }
+
+  function persist(obj) {
+    Object.keys(obj).forEach(function (k) { savedSettings[k] = obj[k]; });
+    try { localStorage.setItem(SKEY, JSON.stringify(savedSettings)); } catch (e) {}
+  }
+  function camCaps() { try { return track && track.getCapabilities ? track.getCapabilities() : {}; } catch (e) { return {}; } }
+  function camSet() { try { return track && track.getSettings ? track.getSettings() : {}; } catch (e) { return {}; } }
+  function setCamInfo(t) { $("cam-info").textContent = t; }
+
+  async function applyCam(obj, save) {
+    if (!track || !Object.keys(obj).length) return false;
+    try {
+      await track.applyConstraints({ advanced: [obj] });
+      if (save !== false) persist(obj);
+      return true;
+    } catch (e) {
+      setCamInfo("Bu ayar uygulanamadı: " + (e && e.message ? e.message : e));
+      return false;
+    }
+  }
+
+  async function restoreSettings() {
+    if (!track || !Object.keys(savedSettings).length) return;
+    var caps = camCaps(), o = {};
+    Object.keys(savedSettings).forEach(function (k) { if (k in caps) o[k] = savedSettings[k]; });
+    if (!Object.keys(o).length) return;
+    try {
+      await track.applyConstraints({ advanced: [o] });
+      if (o.torch) { torchOn = true; $("btn-torch").textContent = "Feneri kapat"; }
+    } catch (e) {}
+  }
+
+  function refreshSettings() {
+    var s = camSet();
+    CTL.forEach(function (c) {
+      var inp = $("ctl-" + c.key);
+      if (inp && typeof s[c.key] === "number") { inp.value = s[c.key]; inp.dispatchEvent(new Event("input")); }
+    });
+    MODES.forEach(function (m) { var sel = $("ctl-" + m.key); if (sel && s[m.key]) sel.value = s[m.key]; });
+    var parts = [];
+    if (s.width) parts.push(s.width + " × " + s.height + " piksel");
+    if (typeof s.exposureTime === "number") parts.push("pozlama " + (s.exposureTime / 10).toLocaleString("tr-TR", { maximumFractionDigits: 2 }) + " ms");
+    if (typeof s.iso === "number") parts.push("ISO " + s.iso);
+    if (s.focusMode) parts.push("odak " + (MODE_TR[s.focusMode] || s.focusMode).toLowerCase());
+    if (s.torch) parts.push("fener açık");
+    setCamInfo(parts.length ? "Şu an: " + parts.join(", ") + "." : "Kamera ayar bilgisi okunamadı.");
+  }
+
+  function buildSettings() {
+    var caps = camCaps(), box = $("cam-controls");
+    box.innerHTML = "";
+    var any = false;
+    MODES.forEach(function (m) {
+      var opts = caps[m.key];
+      if (!Array.isArray(opts) || opts.length < 2) return;
+      any = true;
+      var wrap = document.createElement("div"); wrap.className = "ctl";
+      var id = "ctl-" + m.key;
+      var lab = document.createElement("label"); lab.htmlFor = id; lab.className = "ctl-head"; lab.textContent = m.label;
+      var sel = document.createElement("select"); sel.id = id;
+      opts.forEach(function (o) { var op = document.createElement("option"); op.value = o; op.textContent = MODE_TR[o] || o; sel.appendChild(op); });
+      sel.value = camSet()[m.key] || opts[0];
+      sel.addEventListener("change", async function () {
+        var c = {}; c[m.key] = sel.value;
+        if (await applyCam(c)) refreshSettings();
+      });
+      wrap.appendChild(lab); wrap.appendChild(sel); box.appendChild(wrap);
+    });
+    CTL.forEach(function (c) {
+      var r = caps[c.key];
+      if (!r || typeof r.min !== "number" || typeof r.max !== "number" || r.max <= r.min) return;
+      any = true;
+      var wrap = document.createElement("div"); wrap.className = "ctl";
+      var id = "ctl-" + c.key;
+      var head = document.createElement("label"); head.className = "ctl-head"; head.htmlFor = id;
+      var t = document.createElement("span"); t.textContent = c.label;
+      var val = document.createElement("span"); val.className = "val";
+      head.appendChild(t); head.appendChild(val);
+      var inp = document.createElement("input"); inp.type = "range"; inp.id = id;
+      inp.min = r.min; inp.max = r.max; inp.step = r.step || (r.max - r.min) / 100;
+      var cur = camSet()[c.key]; inp.value = typeof cur === "number" ? cur : r.min;
+      var show = function () {
+        var v = parseFloat(inp.value);
+        val.textContent = c.fmt ? c.fmt(v) : (Math.round(v * 100) / 100).toLocaleString("tr-TR");
+      };
+      show();
+      inp.addEventListener("input", show);
+      inp.addEventListener("change", async function () {
+        var o = {};
+        if (c.mode && Array.isArray(caps[c.mode]) && caps[c.mode].indexOf("manual") !== -1) o[c.mode] = "manual";
+        o[c.key] = parseFloat(inp.value);
+        if (await applyCam(o)) refreshSettings();
+      });
+      wrap.appendChild(head); wrap.appendChild(inp); box.appendChild(wrap);
+    });
+    $("cam-settings").hidden = false;
+    if (!any) {
+      box.innerHTML = "";
+      var p = document.createElement("p"); p.className = "hint";
+      p.textContent = "Bu telefon tarayıcıya ayarlanabilir kamera kontrolü açmıyor. Fener ve otomatik ayarlar kullanılabilir.";
+      box.appendChild(p);
+    }
+    refreshSettings();
+  }
+
+  async function applyPreset(name) {
+    if (!track) return;
+    var caps = camCaps(), s = camSet(), ok = false;
+    var has = function (k, v) { return Array.isArray(caps[k]) && caps[k].indexOf(v) !== -1; };
+    if (name === "moving") {
+      var o = {};
+      if (has("exposureMode", "manual") && caps.exposureTime) {
+        o.exposureMode = "manual";
+        o.exposureTime = Math.max(caps.exposureTime.min, Math.min(caps.exposureTime.max, 10));
+        if (caps.iso) o.iso = Math.round(caps.iso.min + (caps.iso.max - caps.iso.min) * 0.6);
+      }
+      if (caps.torch) o.torch = true;
+      if (!Object.keys(o).length) { setCamInfo("Bu telefon tarayıcıdan pozlama ayarına izin vermiyor. Ortamı olabildiğince aydınlatın."); return; }
+      ok = await applyCam(o);
+      if (ok && o.torch) { torchOn = true; $("btn-torch").textContent = "Feneri kapat"; }
+      if (ok && !o.exposureTime) setCamInfo("Pozlama ayarlanamıyor, sadece fener açıldı.");
+    } else if (name === "still") {
+      var o2 = {};
+      if (has("exposureMode", "continuous")) o2.exposureMode = "continuous";
+      if (has("focusMode", "continuous")) o2.focusMode = "continuous";
+      if (caps.torch) o2.torch = false;
+      ok = await applyCam(o2);
+      if (ok) { torchOn = false; $("btn-torch").textContent = "Feneri aç"; }
+    } else if (name === "lockfocus") {
+      if (has("focusMode", "manual") && typeof s.focusDistance === "number") {
+        ok = await applyCam({ focusMode: "manual", focusDistance: s.focusDistance });
+      } else { setCamInfo("Bu telefonda odak tarayıcıdan kilitlenemiyor."); return; }
+    } else if (name === "reset") {
+      savedSettings = {};
+      try { localStorage.removeItem(SKEY); } catch (e) {}
+      var o3 = {};
+      ["exposureMode", "focusMode", "whiteBalanceMode"].forEach(function (k) { if (has(k, "continuous")) o3[k] = "continuous"; });
+      if (caps.torch) o3.torch = false;
+      ok = await applyCam(o3, false);
+      if (ok) { torchOn = false; $("btn-torch").textContent = "Feneri aç"; }
+    }
+    if (ok) setTimeout(refreshSettings, 300);
+  }
+  document.querySelectorAll("[data-preset]").forEach(function (b) {
+    b.addEventListener("click", function () { applyPreset(b.dataset.preset); });
+  });
 
   function sizeStage() {
     var vw = video.videoWidth, vh = video.videoHeight;
@@ -573,6 +769,8 @@ section.block { margin-top: 26px; }
       torchOn = !torchOn;
       await track.applyConstraints({ advanced: [{ torch: torchOn }] });
       $("btn-torch").textContent = torchOn ? "Feneri kapat" : "Feneri aç";
+      persist({ torch: torchOn });
+      refreshSettings();
     } catch (e) { torchOn = false; $("btn-torch").hidden = true; }
   });
 
